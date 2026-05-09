@@ -25,7 +25,11 @@ from akshare.stock.cons import (
     zh_sina_a_stock_url,
 )
 from akshare.utils import request as ak_request
+from event_service import load_announcement_events, rebuild_announcement_events
+from kb_index import get_index_status, rebuild_search_indexes
+from knowledge_base import get_kb_summary, rebuild_knowledge_base
 from PIL import Image
+from qa_service import ask_question, load_qa_history
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -158,6 +162,16 @@ def ensure_database() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS keywords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS announcements (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 security TEXT NOT NULL,
@@ -224,6 +238,92 @@ def ensure_database() -> None:
             END
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS announcement_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                announcement_id INTEGER NOT NULL,
+                security TEXT NOT NULL,
+                stock_name TEXT,
+                notice_title TEXT NOT NULL,
+                notice_type TEXT,
+                notice_date TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_text TEXT NOT NULL,
+                chunk_hash TEXT NOT NULL,
+                char_count INTEGER NOT NULL DEFAULT 0,
+                parse_source TEXT NOT NULL DEFAULT 'ocr',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(announcement_id, chunk_index)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_announcement_chunks_security_date
+            ON announcement_chunks (security, notice_date, announcement_id, chunk_index)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS announcement_parse_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                announcement_id INTEGER NOT NULL,
+                security TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error_message TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_announcement_parse_tasks_unique
+            ON announcement_parse_tasks (announcement_id, task_type)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS announcement_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                announcement_id INTEGER NOT NULL,
+                security TEXT NOT NULL,
+                stock_name TEXT,
+                event_type TEXT NOT NULL,
+                risk_level TEXT NOT NULL DEFAULT 'medium',
+                event_date TEXT,
+                subject TEXT,
+                summary TEXT NOT NULL,
+                evidence_text TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_announcement_events_security_type_date
+            ON announcement_events (security, event_type, event_date)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS qa_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                question TEXT NOT NULL,
+                question_type TEXT NOT NULL DEFAULT '',
+                retrieved_chunks TEXT NOT NULL DEFAULT '[]',
+                retrieved_announcements TEXT NOT NULL DEFAULT '[]',
+                answer TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         stock_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(st_stocks)").fetchall()
         }
@@ -274,6 +374,15 @@ def clean_tag_name(name: str) -> str:
         raise ValueError("标签名称不能为空")
     if len(name) > 30:
         raise ValueError("标签名称不能超过 30 个字符")
+    return name
+
+
+def clean_keyword_name(name: str) -> str:
+    name = re.sub(r"\s+", " ", (name or "").strip())
+    if not name:
+        raise ValueError("关键词不能为空")
+    if len(name) > 50:
+        raise ValueError("关键词不能超过 50 个字符")
     return name
 
 
@@ -383,6 +492,71 @@ def replace_stock_tags(security: str, tag_ids: list[int]) -> dict[str, object]:
             )
         conn.commit()
     return {"security": security, "tag_ids": unique_ids}
+
+
+def load_keywords() -> list[dict[str, object]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, name, created_at, updated_at
+            FROM keywords
+            ORDER BY name COLLATE NOCASE ASC, id ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_keyword(name: str) -> dict[str, object]:
+    keyword_name = clean_keyword_name(name)
+    now = utc_now_iso()
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO keywords (name, created_at, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (keyword_name, now, now),
+        )
+        conn.commit()
+        keyword_id = cursor.lastrowid
+    return {"id": keyword_id, "name": keyword_name, "created_at": now, "updated_at": now}
+
+
+def update_keyword(keyword_id: int, name: str) -> dict[str, object]:
+    keyword_name = clean_keyword_name(name)
+    now = utc_now_iso()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            """
+            UPDATE keywords
+            SET name = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (keyword_name, now, keyword_id),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError("关键词不存在")
+        conn.commit()
+        row = conn.execute(
+            """
+            SELECT id, name, created_at, updated_at
+            FROM keywords
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (keyword_id,),
+        ).fetchone()
+    return dict(row) if row else {"id": keyword_id, "name": keyword_name, "updated_at": now}
+
+
+def delete_keyword(keyword_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("DELETE FROM keywords WHERE id = ?", (keyword_id,))
+        if cursor.rowcount == 0:
+            raise ValueError("关键词不存在")
+        conn.commit()
 
 
 def normalize_category(name: str) -> str:
@@ -1131,9 +1305,8 @@ def load_announcements(
             f"""
             SELECT a.security, a.stock_name, a.notice_title, a.notice_type, a.notice_date,
                    a.detail_url, a.infocode, a.pdf_url, a.local_pdf_path, a.file_size,
-                   a.download_status, a.ocr_status, a.ocr_source, a.ocr_updated_at,
-                   a.fetched_at, a.downloaded_at, a.ocr_error,
-                   substr(COALESCE(a.ocr_text, ''), 1, 240) AS ocr_text_preview
+                    a.download_status, a.ocr_status, a.ocr_source, a.ocr_updated_at,
+                   a.fetched_at, a.downloaded_at, a.ocr_error, COALESCE(a.ocr_text, '') AS ocr_text
             FROM announcements a
             WHERE {where_sql}
             ORDER BY a.notice_date DESC, a.id DESC
@@ -1141,8 +1314,35 @@ def load_announcements(
             """,
             [*params, page_size, offset],
         ).fetchall()
+
+    def build_keyword_excerpt(text: str, keyword_text: str, context: int = 60) -> str | None:
+        text = (text or "").strip()
+        keyword_text = (keyword_text or "").strip()
+        if not text:
+            return None
+        if not keyword_text:
+            return text[:240]
+        haystack = text.casefold()
+        needle = keyword_text.casefold()
+        index = haystack.find(needle)
+        if index < 0:
+            return text[:240]
+        start = max(index - context, 0)
+        end = min(index + len(keyword_text) + context, len(text))
+        prefix = "..." if start > 0 else ""
+        suffix = "..." if end < len(text) else ""
+        return f"{prefix}{text[start:end]}{suffix}"
+
+    items: list[dict[str, object]] = []
+    for row in rows:
+        item = dict(row)
+        ocr_text = item.pop("ocr_text", "") or ""
+        item["ocr_text_preview"] = (ocr_text[:240] if ocr_text else "")
+        item["ocr_hit_excerpt"] = build_keyword_excerpt(ocr_text, keyword or "")
+        items.append(item)
+
     return {
-        "items": [dict(row) for row in rows],
+        "items": items,
         "pagination": {
             "page": page,
             "page_size": page_size,
@@ -1596,6 +1796,79 @@ INDEX_HTML = """<!DOCTYPE html>
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     }
 
+    .qa-panel {
+      margin-top: 16px;
+      padding: 16px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .qa-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .qa-toolbar input,
+    .qa-toolbar select {
+      flex: 1 1 240px;
+      min-width: 220px;
+    }
+
+    .qa-grid {
+      margin-top: 14px;
+      display: grid;
+      gap: 14px;
+      grid-template-columns: minmax(0, 1.5fr) minmax(320px, 1fr);
+    }
+
+    .qa-block {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+      padding: 14px;
+    }
+
+    .qa-block h3 {
+      margin: 0 0 10px;
+      font-size: 16px;
+    }
+
+    .qa-answer {
+      white-space: pre-wrap;
+      line-height: 1.7;
+      font-size: 14px;
+    }
+
+    .qa-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .qa-item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px 12px;
+    }
+
+    .qa-item strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 14px;
+    }
+
+    .qa-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
     .stat {
       padding: 12px;
       border: 1px solid var(--line);
@@ -1751,6 +2024,14 @@ INDEX_HTML = """<!DOCTYPE html>
       word-break: break-word;
     }
 
+    .hit-mark {
+      display: inline;
+      padding: 0 2px;
+      border-radius: 4px;
+      background: #fecaca;
+      color: #991b1b;
+    }
+
     table {
       width: 100%;
       min-width: 1800px;
@@ -1836,6 +2117,7 @@ INDEX_HTML = """<!DOCTYPE html>
         <button id="openAllNoticesButton" type="button">全部公告检索</button>
         <button id="ocrAllNoticesButton" type="button">OCR 全部公告</button>
         <button id="openTagManagerButton" type="button">标签设置</button>
+        <button id="openKeywordManagerButton" type="button">关键词设置</button>
         <select id="categoryFilter" aria-label="分类筛选">
           <option value="">全部</option>
           <option value="ST">仅 ST</option>
@@ -1852,6 +2134,29 @@ INDEX_HTML = """<!DOCTYPE html>
     </section>
 
     <section class="stats" id="stats"></section>
+
+    <section class="qa-panel">
+      <div class="qa-toolbar">
+        <input id="qaQuestionInput" type="text" placeholder="输入问题，例如：哪些股票有重大违法的可能性" aria-label="知识库提问">
+        <select id="qaSecuritySelect" aria-label="限定股票">
+          <option value="">全部股票</option>
+        </select>
+        <button id="qaAskButton" type="button">开始提问</button>
+        <button id="qaReloadHistoryButton" type="button">刷新历史</button>
+      </div>
+      <div class="qa-grid">
+        <div class="qa-block">
+          <h3>问答结果</h3>
+          <div id="qaAnswer" class="qa-answer">还没有提问。</div>
+          <div id="qaStockCandidates" class="qa-list" style="margin-top:12px;"></div>
+          <div id="qaEvidenceList" class="qa-list" style="margin-top:12px;"></div>
+        </div>
+        <div class="qa-block">
+          <h3>提问历史</h3>
+          <div id="qaHistoryList" class="qa-list"></div>
+        </div>
+      </div>
+    </section>
 
     <section class="table-wrap">
       <table>
@@ -1959,6 +2264,27 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div id="keywordManagerModal" class="modal" aria-hidden="true">
+    <div class="modal-card" style="width:min(760px,100%);max-height:min(82vh,780px);">
+      <div class="modal-header">
+        <div>
+          <h2 style="margin: 0; font-size: 22px;">关键词管理</h2>
+          <div class="notice-summary" style="margin-top: 6px;">
+            <span>添加、修改、删除关键词，可一键带入公告搜索</span>
+          </div>
+        </div>
+        <button id="closeKeywordManagerButton" type="button">关闭</button>
+      </div>
+      <div class="modal-toolbar">
+        <input id="keywordNameInput" type="text" placeholder="输入新关键词" aria-label="新关键词">
+        <button id="createKeywordButton" type="button">添加关键词</button>
+      </div>
+      <div class="modal-body">
+        <div id="keywordList" class="tag-list"></div>
+      </div>
+    </div>
+  </div>
+
   <script>
     const statusEl = document.getElementById("status");
     const statsEl = document.getElementById("stats");
@@ -1970,10 +2296,14 @@ INDEX_HTML = """<!DOCTYPE html>
     const openAllNoticesButton = document.getElementById("openAllNoticesButton");
     const ocrAllNoticesButton = document.getElementById("ocrAllNoticesButton");
     const openTagManagerButton = document.getElementById("openTagManagerButton");
+    const openKeywordManagerButton = document.getElementById("openKeywordManagerButton");
     const tagFilterEl = document.getElementById("tagFilter");
     const tagNameInput = document.getElementById("tagNameInput");
     const createTagButton = document.getElementById("createTagButton");
     const tagListEl = document.getElementById("tagList");
+    const keywordNameInput = document.getElementById("keywordNameInput");
+    const createKeywordButton = document.getElementById("createKeywordButton");
+    const keywordListEl = document.getElementById("keywordList");
     const prevPageButton = document.getElementById("prevPageButton");
     const nextPageButton = document.getElementById("nextPageButton");
     const pageInfoEl = document.getElementById("pageInfo");
@@ -1993,6 +2323,8 @@ INDEX_HTML = """<!DOCTYPE html>
     const noticePageInfoEl = document.getElementById("noticePageInfo");
     const tagManagerModalEl = document.getElementById("tagManagerModal");
     const closeTagManagerButton = document.getElementById("closeTagManagerButton");
+    const keywordManagerModalEl = document.getElementById("keywordManagerModal");
+    const closeKeywordManagerButton = document.getElementById("closeKeywordManagerButton");
     const stockTagModalEl = document.getElementById("stockTagModal");
     const stockTagModalTitleEl = document.getElementById("stockTagModalTitle");
     const stockTagModalSummaryEl = document.getElementById("stockTagModalSummary");
@@ -2001,9 +2333,18 @@ INDEX_HTML = """<!DOCTYPE html>
     const closeStockTagModalButton = document.getElementById("closeStockTagModalButton");
     const saveStockTagsButton = document.getElementById("saveStockTagsButton");
     const selectPageCheckbox = document.getElementById("selectPageCheckbox");
+    const qaQuestionInput = document.getElementById("qaQuestionInput");
+    const qaSecuritySelect = document.getElementById("qaSecuritySelect");
+    const qaAskButton = document.getElementById("qaAskButton");
+    const qaReloadHistoryButton = document.getElementById("qaReloadHistoryButton");
+    const qaAnswerEl = document.getElementById("qaAnswer");
+    const qaStockCandidatesEl = document.getElementById("qaStockCandidates");
+    const qaEvidenceListEl = document.getElementById("qaEvidenceList");
+    const qaHistoryListEl = document.getElementById("qaHistoryList");
     const sortableHeaders = Array.from(document.querySelectorAll("th.sortable"));
     let allRows = [];
     let allTags = [];
+    let allKeywords = [];
     const selectedStockCodes = new Set();
     let sortState = { key: "category", direction: "desc", type: "string" };
     let filteredRows = [];
@@ -2024,6 +2365,9 @@ INDEX_HTML = """<!DOCTYPE html>
       dateFrom: "",
       dateTo: "",
       totalPages: 1,
+    };
+    const qaState = {
+      history: [],
     };
 
     function setStatus(message, isError = false) {
@@ -2075,6 +2419,36 @@ INDEX_HTML = """<!DOCTYPE html>
         .replaceAll("'", "&#39;");
     }
 
+    function escapeRegExp(value) {
+      let result = (value ?? "").toString();
+      const slash = String.fromCharCode(92);
+      const specialChars = [slash, ".", "*", "+", "?", "^", "$", "{", "}", "(", ")", "|", "[", "]"];
+      for (const char of specialChars) {
+        result = result.replaceAll(char, slash + char);
+      }
+      return result;
+    }
+
+    function highlightKeyword(text, keyword) {
+      const source = (text ?? "").toString();
+      const q = (keyword ?? "").trim();
+      if (!source) return "";
+      if (!q) return escapeHtml(source);
+      const pattern = new RegExp(escapeRegExp(q), "gi");
+      let lastIndex = 0;
+      let result = "";
+      for (const match of source.matchAll(pattern)) {
+        const index = match.index ?? 0;
+        const matched = match[0] ?? "";
+        result += escapeHtml(source.slice(lastIndex, index));
+        result += `<mark class="hit-mark">${escapeHtml(matched)}</mark>`;
+        lastIndex = index + matched.length;
+      }
+      if (!result) return escapeHtml(source);
+      result += escapeHtml(source.slice(lastIndex));
+      return result;
+    }
+
     function compareValues(left, right, type) {
       if (type === "number") {
         const a = left === null || left === undefined || left === "" ? Number.NEGATIVE_INFINITY : Number(left);
@@ -2102,6 +2476,15 @@ INDEX_HTML = """<!DOCTYPE html>
         ...allTags.map((tag) => `<option value="${tag.id}">${escapeHtml(tag.name)}</option>`),
       ].join("");
       tagFilterEl.value = allTags.some((tag) => String(tag.id) === current) ? current : "";
+    }
+
+    function renderQaSecurityOptions() {
+      const current = qaSecuritySelect.value;
+      qaSecuritySelect.innerHTML = [
+        `<option value="">全部股票</option>`,
+        ...allRows.map((row) => `<option value="${row.code}">${escapeHtml(row.code)} ${escapeHtml(row.name)}</option>`),
+      ].join("");
+      qaSecuritySelect.value = allRows.some((row) => row.code === current) ? current : "";
     }
 
     function updateBatchSelectionUi() {
@@ -2166,6 +2549,100 @@ INDEX_HTML = """<!DOCTYPE html>
       });
     }
 
+    function renderKeywordManager() {
+      if (!allKeywords.length) {
+        keywordListEl.innerHTML = `<span class="tag-chip">还没有关键词</span>`;
+        return;
+      }
+      keywordListEl.innerHTML = allKeywords.map((keyword) => `
+        <span class="tag-chip">
+          <strong>${escapeHtml(keyword.name)}</strong>
+          <button type="button" data-keyword-use="${keyword.id}">搜索</button>
+          <button type="button" data-keyword-edit="${keyword.id}">改名</button>
+          <button type="button" data-keyword-delete="${keyword.id}">删除</button>
+        </span>
+      `).join("");
+
+      keywordListEl.querySelectorAll("[data-keyword-use]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const keyword = allKeywords.find((item) => String(item.id) === button.dataset.keywordUse);
+          if (!keyword) return;
+          noticeSearchInput.value = keyword.name;
+          noticeState.keyword = keyword.name;
+          if (!noticeModalEl.classList.contains("open")) {
+            openNoticeModal(null, "全部公告");
+          } else {
+            noticeState.page = 1;
+            loadNotices();
+          }
+        });
+      });
+
+      keywordListEl.querySelectorAll("[data-keyword-edit]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const keyword = allKeywords.find((item) => String(item.id) === button.dataset.keywordEdit);
+          if (!keyword) return;
+          const nextName = window.prompt("修改关键词", keyword.name);
+          if (nextName === null) return;
+          await saveKeyword(keyword.id, nextName);
+        });
+      });
+
+      keywordListEl.querySelectorAll("[data-keyword-delete]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const keyword = allKeywords.find((item) => String(item.id) === button.dataset.keywordDelete);
+          if (!keyword) return;
+          if (!window.confirm(`确认删除关键词“${keyword.name}”吗？`)) return;
+          await deleteKeywordById(keyword.id);
+        });
+      });
+    }
+
+    function renderQaHistory(items) {
+      qaState.history = items || [];
+      if (!qaState.history.length) {
+        qaHistoryListEl.innerHTML = `<div class="qa-item">还没有提问历史。</div>`;
+        return;
+      }
+      qaHistoryListEl.innerHTML = qaState.history.map((item) => `
+        <article class="qa-item">
+          <strong>${escapeHtml(item.question)}</strong>
+          <div>${escapeHtml(item.answer || "-")}</div>
+          <div class="qa-meta">
+            <span>类型：${escapeHtml(item.question_type || "-")}</span>
+            <span>时间：${escapeHtml(item.created_at || "-")}</span>
+          </div>
+        </article>
+      `).join("");
+    }
+
+    function renderQaResult(payload) {
+      qaAnswerEl.textContent = payload.answer || "没有生成回答。";
+      const stockCandidates = payload.stock_candidates || [];
+      const evidenceChunks = payload.evidence_chunks || [];
+      qaStockCandidatesEl.innerHTML = stockCandidates.length ? stockCandidates.map((item) => `
+        <article class="qa-item">
+          <strong>${escapeHtml(item.security)} ${escapeHtml(item.stock_name || "")}</strong>
+          <div>综合分 ${escapeHtml(item.score)}，命中 ${escapeHtml(item.evidence_count)} 段</div>
+          <div class="qa-meta">
+            <span>关键词：${escapeHtml((item.matched_terms || []).join("、") || "-")}</span>
+            <span>最近公告：${escapeHtml(item.latest_notice_date || "-")}</span>
+          </div>
+        </article>
+      `).join("") : "";
+      qaEvidenceListEl.innerHTML = evidenceChunks.length ? evidenceChunks.map((item) => `
+        <article class="qa-item">
+          <strong>${escapeHtml(item.notice_title || "-")}</strong>
+          <div>${highlightKeyword(item.chunk_text || "", (payload.query_terms || [])[0] || "")}</div>
+          <div class="qa-meta">
+            <span>代码：${escapeHtml(item.security || "-")}</span>
+            <span>日期：${escapeHtml(item.notice_date || "-")}</span>
+            <span>分数：${escapeHtml(item.score)}</span>
+          </div>
+        </article>
+      `).join("") : `<div class="qa-item">当前没有命中的证据分段。</div>`;
+    }
+
     function openTagManagerModal() {
       tagManagerModalEl.classList.add("open");
       tagManagerModalEl.setAttribute("aria-hidden", "false");
@@ -2175,6 +2652,17 @@ INDEX_HTML = """<!DOCTYPE html>
     function closeTagManagerModal() {
       tagManagerModalEl.classList.remove("open");
       tagManagerModalEl.setAttribute("aria-hidden", "true");
+    }
+
+    function openKeywordManagerModal() {
+      keywordManagerModalEl.classList.add("open");
+      keywordManagerModalEl.setAttribute("aria-hidden", "false");
+      keywordNameInput.focus();
+    }
+
+    function closeKeywordManagerModal() {
+      keywordManagerModalEl.classList.remove("open");
+      keywordManagerModalEl.setAttribute("aria-hidden", "true");
     }
 
     function openStockTagModal(row) {
@@ -2354,9 +2842,10 @@ INDEX_HTML = """<!DOCTYPE html>
         return;
       }
 
+      const keyword = (noticeState.keyword || "").trim();
       noticeListEl.innerHTML = items.map((item) => `
         <article class="notice-item">
-          <h3>${item.notice_title}</h3>
+          <h3>${highlightKeyword(item.notice_title, keyword)}</h3>
           <div class="notice-meta">
             <span>代码：${item.security}</span>
             <span>日期：${item.notice_date}</span>
@@ -2370,8 +2859,8 @@ INDEX_HTML = """<!DOCTYPE html>
             ${item.pdf_url ? `<a href="${item.pdf_url}" target="_blank" rel="noreferrer">PDF 链接</a>` : ""}
             ${item.local_pdf_path ? `<span>本地文件：${item.local_pdf_path}</span>` : ""}
           </div>
-          ${item.ocr_text_preview ? `<div class="notice-excerpt">${item.ocr_text_preview}</div>` : ""}
-          ${item.ocr_error ? `<div class="notice-excerpt" style="background:#fee2e2;color:#991b1b;">${item.ocr_error}</div>` : ""}
+          ${(item.ocr_hit_excerpt || item.ocr_text_preview) ? `<div class="notice-excerpt">${highlightKeyword(item.ocr_hit_excerpt || item.ocr_text_preview, keyword)}</div>` : ""}
+          ${item.ocr_error ? `<div class="notice-excerpt" style="background:#fee2e2;color:#991b1b;">${escapeHtml(item.ocr_error)}</div>` : ""}
         </article>
       `).join("");
     }
@@ -2485,11 +2974,57 @@ INDEX_HTML = """<!DOCTYPE html>
         const payload = await response.json();
         renderStats(payload.summary);
         allRows = payload.items;
+        renderQaSecurityOptions();
         applyFiltersAndSort();
       } catch (error) {
         allRows = [];
         renderRows([]);
+        renderQaSecurityOptions();
         setStatus(`加载失败：${error.message}`, true);
+      }
+    }
+
+    async function loadQaHistory() {
+      try {
+        const response = await fetch("/api/qa/history?limit=10");
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        renderQaHistory(payload.items || []);
+      } catch (error) {
+        qaHistoryListEl.innerHTML = `<div class="qa-item">历史加载失败：${escapeHtml(error.message)}</div>`;
+      }
+    }
+
+    async function askQaQuestion() {
+      const question = qaQuestionInput.value.trim();
+      if (!question) {
+        setStatus("请输入问题", true);
+        return;
+      }
+      qaAskButton.disabled = true;
+      qaAnswerEl.textContent = "正在检索公告证据并生成回答...";
+      qaStockCandidatesEl.innerHTML = "";
+      qaEvidenceListEl.innerHTML = "";
+      try {
+        const response = await fetch("/api/qa/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question,
+            security: qaSecuritySelect.value || null,
+            limit: 8,
+          }),
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+        renderQaResult(payload);
+        await loadQaHistory();
+        setStatus("问答完成");
+      } catch (error) {
+        qaAnswerEl.textContent = `提问失败：${error.message}`;
+        setStatus(`提问失败：${error.message}`, true);
+      } finally {
+        qaAskButton.disabled = false;
       }
     }
 
@@ -2507,6 +3042,20 @@ INDEX_HTML = """<!DOCTYPE html>
         renderTagFilterOptions();
         renderTagManager();
         setStatus(`标签加载失败：${error.message}`, true);
+      }
+    }
+
+    async function loadKeywords() {
+      try {
+        const response = await fetch("/api/keywords");
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        allKeywords = payload.items || [];
+        renderKeywordManager();
+      } catch (error) {
+        allKeywords = [];
+        renderKeywordManager();
+        setStatus(`关键词加载失败：${error.message}`, true);
       }
     }
 
@@ -2539,6 +3088,35 @@ INDEX_HTML = """<!DOCTYPE html>
       await loadTags();
       await loadData();
       setStatus("标签已删除");
+    }
+
+    async function saveKeyword(keywordId, keywordName) {
+      const trimmed = (keywordName || "").trim();
+      if (!trimmed) return;
+      const url = keywordId ? "/api/keywords/update" : "/api/keywords";
+      const body = JSON.stringify(keywordId ? { id: keywordId, name: trimmed } : { name: trimmed });
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      keywordNameInput.value = "";
+      await loadKeywords();
+      setStatus(keywordId ? "关键词已更新" : "关键词已添加");
+    }
+
+    async function deleteKeywordById(keywordId) {
+      const response = await fetch("/api/keywords/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: keywordId }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      await loadKeywords();
+      setStatus("关键词已删除");
     }
 
     async function saveCurrentStockTags() {
@@ -2618,6 +3196,29 @@ INDEX_HTML = """<!DOCTYPE html>
         setStatus(`添加标签失败：${error.message}`, true);
       }
     });
+    createKeywordButton.addEventListener("click", async () => {
+      try {
+        await saveKeyword(null, keywordNameInput.value);
+      } catch (error) {
+        setStatus(`添加关键词失败：${error.message}`, true);
+      }
+    });
+    keywordNameInput.addEventListener("keydown", async (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      try {
+        await saveKeyword(null, keywordNameInput.value);
+      } catch (error) {
+        setStatus(`添加关键词失败：${error.message}`, true);
+      }
+    });
+    qaAskButton.addEventListener("click", askQaQuestion);
+    qaReloadHistoryButton.addEventListener("click", loadQaHistory);
+    qaQuestionInput.addEventListener("keydown", async (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      await askQaQuestion();
+    });
     prevPageButton.addEventListener("click", () => {
       if (currentPage > 1) {
         currentPage -= 1;
@@ -2649,14 +3250,19 @@ INDEX_HTML = """<!DOCTYPE html>
     openAllNoticesButton.addEventListener("click", () => openNoticeModal(null, "全部公告"));
     ocrAllNoticesButton.addEventListener("click", () => runNoticeOcr(null));
     openTagManagerButton.addEventListener("click", openTagManagerModal);
+    openKeywordManagerButton.addEventListener("click", openKeywordManagerModal);
     closeNoticeModalButton.addEventListener("click", closeNoticeModal);
     closeTagManagerButton.addEventListener("click", closeTagManagerModal);
+    closeKeywordManagerButton.addEventListener("click", closeKeywordManagerModal);
     closeStockTagModalButton.addEventListener("click", closeStockTagModal);
     noticeModalEl.addEventListener("click", (event) => {
       if (event.target === noticeModalEl) closeNoticeModal();
     });
     tagManagerModalEl.addEventListener("click", (event) => {
       if (event.target === tagManagerModalEl) closeTagManagerModal();
+    });
+    keywordManagerModalEl.addEventListener("click", (event) => {
+      if (event.target === keywordManagerModalEl) closeKeywordManagerModal();
     });
     stockTagModalEl.addEventListener("click", (event) => {
       if (event.target === stockTagModalEl) closeStockTagModal();
@@ -2708,7 +3314,7 @@ INDEX_HTML = """<!DOCTYPE html>
     saveStockTagsButton.addEventListener("click", saveCurrentStockTags);
     updateHeaderState();
     updateBatchSelectionUi();
-    loadTags().then(loadData);
+    Promise.all([loadTags(), loadKeywords(), loadQaHistory()]).then(loadData);
   </script>
 </body>
 </html>
@@ -2737,6 +3343,9 @@ class StockRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/tags":
             self.respond_json({"items": load_tags()})
             return
+        if parsed.path == "/api/keywords":
+            self.respond_json({"items": load_keywords()})
+            return
         if parsed.path == "/api/notices":
             query = parse_qs(parsed.query)
             security = query.get("security", [""])[0].strip() or None
@@ -2759,6 +3368,31 @@ class StockRequestHandler(BaseHTTPRequestHandler):
                 "pagination": notice_payload["pagination"],
             }
             self.respond_json(payload)
+            return
+        if parsed.path == "/api/kb/summary":
+            self.respond_json(get_kb_summary(DB_PATH))
+            return
+        if parsed.path == "/api/kb/index/status":
+            self.respond_json(get_index_status(BASE_DIR, DB_PATH))
+            return
+        if parsed.path == "/api/qa/history":
+            query = parse_qs(parsed.query)
+            limit = int(query.get("limit", ["20"])[0] or "20")
+            self.respond_json(load_qa_history(DB_PATH, limit=limit))
+            return
+        if parsed.path == "/api/events":
+            query = parse_qs(parsed.query)
+            security = query.get("security", [""])[0].strip() or None
+            event_type = query.get("event_type", [""])[0].strip() or None
+            limit = int(query.get("limit", ["100"])[0] or "100")
+            self.respond_json(
+                load_announcement_events(
+                    DB_PATH,
+                    security=security,
+                    event_type=event_type,
+                    limit=limit,
+                )
+            )
             return
         self.respond_json({"error": "Not Found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -2799,6 +3433,30 @@ class StockRequestHandler(BaseHTTPRequestHandler):
             try:
                 payload = self.read_json_body()
                 delete_tag(int(payload.get("id")))
+                self.respond_json({"ok": True})
+            except Exception as exc:  # pragma: no cover
+                self.respond_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/keywords":
+            try:
+                payload = self.read_json_body()
+                result = create_keyword(str(payload.get("name") or ""))
+                self.respond_json(result, status=HTTPStatus.CREATED)
+            except Exception as exc:  # pragma: no cover
+                self.respond_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/keywords/update":
+            try:
+                payload = self.read_json_body()
+                result = update_keyword(int(payload.get("id")), str(payload.get("name") or ""))
+                self.respond_json(result)
+            except Exception as exc:  # pragma: no cover
+                self.respond_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/keywords/delete":
+            try:
+                payload = self.read_json_body()
+                delete_keyword(int(payload.get("id")))
                 self.respond_json({"ok": True})
             except Exception as exc:  # pragma: no cover
                 self.respond_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
@@ -2851,6 +3509,78 @@ class StockRequestHandler(BaseHTTPRequestHandler):
                 if not isinstance(securities, list):
                     raise ValueError("securities 必须是数组")
                 result = batch_sync_notices_and_ocr(securities)
+                self.respond_json(result, status=HTTPStatus.CREATED)
+            except Exception as exc:  # pragma: no cover
+                self.respond_json(
+                    {"error": f"{exc.__class__.__name__}: {exc}"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            return
+        if parsed.path == "/api/kb/rebuild":
+            try:
+                payload = self.read_json_body()
+                security = str(payload.get("security") or "").strip() or None
+                force = bool(payload.get("force"))
+                limit_value = payload.get("limit")
+                limit = int(limit_value) if limit_value not in (None, "") else None
+                result = rebuild_knowledge_base(
+                    DB_PATH,
+                    security=security,
+                    force=force,
+                    limit=limit,
+                )
+                self.respond_json(result, status=HTTPStatus.CREATED)
+            except Exception as exc:  # pragma: no cover
+                self.respond_json(
+                    {"error": f"{exc.__class__.__name__}: {exc}"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            return
+        if parsed.path == "/api/kb/index/rebuild":
+            try:
+                payload = self.read_json_body()
+                security = str(payload.get("security") or "").strip() or None
+                result = rebuild_search_indexes(BASE_DIR, DB_PATH, security=security)
+                self.respond_json(result, status=HTTPStatus.CREATED)
+            except Exception as exc:  # pragma: no cover
+                self.respond_json(
+                    {"error": f"{exc.__class__.__name__}: {exc}"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            return
+        if parsed.path == "/api/qa/ask":
+            try:
+                payload = self.read_json_body()
+                question = str(payload.get("question") or "")
+                security = str(payload.get("security") or "").strip() or None
+                limit_value = payload.get("limit")
+                limit = int(limit_value) if limit_value not in (None, "") else 12
+                result = ask_question(
+                    DB_PATH,
+                    question=question,
+                    security=security,
+                    limit=limit,
+                )
+                self.respond_json(result, status=HTTPStatus.CREATED)
+            except Exception as exc:  # pragma: no cover
+                self.respond_json(
+                    {"error": f"{exc.__class__.__name__}: {exc}"},
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+            return
+        if parsed.path == "/api/events/rebuild":
+            try:
+                payload = self.read_json_body()
+                security = str(payload.get("security") or "").strip() or None
+                force = bool(payload.get("force"))
+                limit_value = payload.get("limit")
+                limit = int(limit_value) if limit_value not in (None, "") else None
+                result = rebuild_announcement_events(
+                    DB_PATH,
+                    security=security,
+                    force=force,
+                    limit=limit,
+                )
                 self.respond_json(result, status=HTTPStatus.CREATED)
             except Exception as exc:  # pragma: no cover
                 self.respond_json(
