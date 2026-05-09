@@ -11,6 +11,7 @@
 ## 运行
 
 ```bash
+python init_db.py
 python app.py
 ```
 
@@ -23,5 +24,6 @@ python app.py
 - 股票数据来自 `ak.stock_zh_a_st_em()`
 - 当东方财富 ST 板块不可用时，会回退到新浪 A 股实时行情并在本地筛选 `ST` / `*ST`
 - `data/stocks.db` 不再纳入 Git 版本控制，仅保留本地使用
+- `python init_db.py` 可单独初始化数据库结构和 `data/notices` 目录
 - `python app.py` 首次启动时会自动初始化数据库结构
 - 首次运行后，如果页面里还没有数据，点击“刷新本地数据库”即可触发抓取并写库
