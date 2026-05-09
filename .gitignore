@@ -1,0 +1,7 @@
+__pycache__/
+.omx/
+server.log
+server.err.log
+data/notices/
+!data/
+!data/stocks.db
